@@ -1,28 +1,22 @@
 name: test
-on: [push, pull_request]
+on: [push, pull_request, workflow_dispatch]
 jobs:
   test:
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
     strategy:
       matrix:
-        go: [1.13, 1.11]
-    env:
-      GO111MODULE: auto
+        go-version: ['1.25', '1.26']
+        os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
-    - uses: actions/checkout@v1
-    - name: Setup go
-      uses: actions/setup-go@v1
+    - uses: actions/checkout@v4
+    - uses: actions/setup-go@v5
       with:
-        go-version: ${{ matrix.go }}
-    - name: Download dependencies
-      run: go mod download && go mod verify && go mod graph
-    - name: Build tests
-      run: go test -c
-    - name: Run unit tests
+        go-version: ${{ matrix.go-version }}
+    - name: Test
       run: go test -race -cover ./...
-    - name: Test building on windows
-      env: {GOOS: windows}
-      run: go test -c
-    - name: Test building on darwin
-      env: {GOOS: darwin}
-      run: go test -c
+      if: runner.os != 'Windows'
+    - name: Test (Windows)
+      run: go test -cover ./...
+      if: runner.os == 'Windows'

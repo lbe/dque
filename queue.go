@@ -1,6 +1,4 @@
-//
 // Package dque is a fast embedded durable queue for Go
-//
 package dque
 
 //
@@ -10,17 +8,17 @@ package dque
 //
 
 import (
-	"strconv"
-	"sync"
-
-	"github.com/gofrs/flock"
-	"github.com/pkg/errors"
-
-	"io/ioutil"
+	"fmt"
 	"math"
 	"os"
-	"path"
+	"path/filepath"
 	"regexp"
+	"strconv"
+	"strings"
+	"sync"
+
+	"github.com/joncrlsn/dque/internal/errors"
+	"github.com/joncrlsn/dque/internal/flock"
 )
 
 const lockFile = "lock.lock"
@@ -36,7 +34,7 @@ var (
 )
 
 func init() {
-	filePattern, _ = regexp.Compile(`^([0-9]+)\.dque$`)
+	filePattern = regexp.MustCompile(`^([0-9]+)\.dque$`)
 }
 
 type config struct {
@@ -63,105 +61,103 @@ type DQue struct {
 	emptyCond *sync.Cond
 
 	turbo bool
+
+	// closed is set to true when Close() is called and is used by unsynchronized
+	// readers to avoid data races on the segment and lock fields.
+	closed bool
+}
+
+// validateQueueInputs validates the common inputs for all constructors and
+// returns the full path to the queue directory. It rejects unsafe queue names
+// (empty, path separators, '.'/'..', or '..' segments) and invalid
+// itemsPerSegment values.
+func validateQueueInputs(name, dirPath string, itemsPerSegment int) (string, error) {
+	if len(name) == 0 {
+		return "", errors.New("the queue name requires a value")
+	}
+	if name == "." || name == ".." {
+		return "", errors.New("the queue name cannot be '.' or '..'")
+	}
+	// Reject any path separators so the queue cannot escape dirPath.
+	if strings.ContainsAny(name, string(os.PathSeparator)+"/\\") {
+		return "", errors.New("the queue name cannot contain path separators")
+	}
+	if len(dirPath) == 0 {
+		return "", errors.New("the queue directory requires a value")
+	}
+	if exists, err := dirExists(dirPath); err != nil {
+		return "", fmt.Errorf("checking directory %s: %w", dirPath, err)
+	} else if !exists {
+		return "", errors.New("the given queue directory is not valid: " + dirPath)
+	}
+	if itemsPerSegment <= 0 {
+		return "", errors.New("itemsPerSegment must be greater than zero")
+	}
+	return filepath.Join(dirPath, name), nil
+}
+
+// createQueueDir ensures the queue directory exists (or does not exist),
+// creating it when mustCreate is true. It returns a descriptive error
+// when the precondition is violated or when the filesystem operation fails.
+func createQueueDir(fullPath string, mustCreate bool) error {
+	exists, err := dirExists(fullPath)
+	if err != nil {
+		return err
+	}
+	if mustCreate && exists {
+		return errors.New("the given queue directory already exists: " + fullPath + ". Use Open instead")
+	}
+	if !mustCreate && !exists {
+		return errors.New("the given queue does not exist (" + fullPath + ")")
+	}
+	if mustCreate {
+		return os.Mkdir(fullPath, 0755)
+	}
+	return nil
 }
 
 // New creates a new durable queue
 func New(name string, dirPath string, itemsPerSegment int, builder func() interface{}) (*DQue, error) {
-
-	// Validation
-	if len(name) == 0 {
-		return nil, errors.New("the queue name requires a value")
-	}
-	if len(dirPath) == 0 {
-		return nil, errors.New("the queue directory requires a value")
-	}
-	if !dirExists(dirPath) {
-		return nil, errors.New("the given queue directory is not valid: " + dirPath)
-	}
-	fullPath := path.Join(dirPath, name)
-	if dirExists(fullPath) {
-		return nil, errors.New("the given queue directory already exists: " + fullPath + ". Use Open instead")
-	}
-
-	if err := os.Mkdir(fullPath, 0755); err != nil {
-		return nil, errors.Wrap(err, "error creating queue directory "+fullPath)
-	}
-
-	q := DQue{Name: name, DirPath: dirPath}
-	q.fullPath = fullPath
-	q.config.ItemsPerSegment = itemsPerSegment
-	q.builder = builder
-	q.emptyCond = sync.NewCond(&q.mutex)
-
-	if err := q.lock(); err != nil {
+	fullPath, err := validateQueueInputs(name, dirPath, itemsPerSegment)
+	if err != nil {
 		return nil, err
 	}
-
-	if err := q.load(); err != nil {
-		er := q.fileLock.Unlock()
-		if er != nil {
-			return nil, er
-		}
+	if err := createQueueDir(fullPath, true); err != nil {
 		return nil, err
 	}
-
-	return &q, nil
+	q := &DQue{Name: name, DirPath: dirPath}
+	if err := q.initQueue(fullPath, itemsPerSegment, builder); err != nil {
+		return nil, err
+	}
+	return q, nil
 }
 
 // Open opens an existing durable queue.
 func Open(name string, dirPath string, itemsPerSegment int, builder func() interface{}) (*DQue, error) {
-
-	// Validation
-	if len(name) == 0 {
-		return nil, errors.New("the queue name requires a value")
-	}
-	if len(dirPath) == 0 {
-		return nil, errors.New("the queue directory requires a value")
-	}
-	if !dirExists(dirPath) {
-		return nil, errors.New("the given queue directory is not valid (" + dirPath + ")")
-	}
-	fullPath := path.Join(dirPath, name)
-	if !dirExists(fullPath) {
-		return nil, errors.New("the given queue does not exist (" + fullPath + ")")
-	}
-
-	q := DQue{Name: name, DirPath: dirPath}
-	q.fullPath = fullPath
-	q.config.ItemsPerSegment = itemsPerSegment
-	q.builder = builder
-	q.emptyCond = sync.NewCond(&q.mutex)
-
-	if err := q.lock(); err != nil {
+	fullPath, err := validateQueueInputs(name, dirPath, itemsPerSegment)
+	if err != nil {
 		return nil, err
 	}
-
-	if err := q.load(); err != nil {
-		er := q.fileLock.Unlock()
-		if er != nil {
-			return nil, er
-		}
+	if err := createQueueDir(fullPath, false); err != nil {
 		return nil, err
 	}
-
-	return &q, nil
+	q := &DQue{Name: name, DirPath: dirPath}
+	if err := q.initQueue(fullPath, itemsPerSegment, builder); err != nil {
+		return nil, err
+	}
+	return q, nil
 }
 
 // NewOrOpen either creates a new queue or opens an existing durable queue.
 func NewOrOpen(name string, dirPath string, itemsPerSegment int, builder func() interface{}) (*DQue, error) {
 
-	// Validation
-	if len(name) == 0 {
-		return nil, errors.New("the queue name requires a value")
+	fullPath, err := validateQueueInputs(name, dirPath, itemsPerSegment)
+	if err != nil {
+		return nil, err
 	}
-	if len(dirPath) == 0 {
-		return nil, errors.New("the queue directory requires a value")
-	}
-	if !dirExists(dirPath) {
-		return nil, errors.New("the given queue directory is not valid (" + dirPath + ")")
-	}
-	fullPath := path.Join(dirPath, name)
-	if dirExists(fullPath) {
+	if exists, err := dirExists(fullPath); err != nil {
+		return nil, fmt.Errorf("checking directory %s: %w", fullPath, err)
+	} else if exists {
 		return Open(name, dirPath, itemsPerSegment, builder)
 	}
 
@@ -175,36 +171,37 @@ func (q *DQue) Close() error {
 	q.mutex.Lock()
 	defer q.mutex.Unlock()
 
-	if q.fileLock == nil {
+	if q.closed {
 		return ErrQueueClosed
 	}
 
-	err := q.fileLock.Close()
-	if err != nil {
-		return err
-	}
-
-	// Finally mark this instance as closed to prevent any further access
-	q.fileLock = nil
-
-	// Wake-up any waiting goroutines for blocking queue access - they should get a ErrQueueClosed
-	q.emptyCond.Broadcast()
-
-	// Close the first and last segments' file handles
-	if err = q.firstSegment.close(); err != nil {
-		return err
+	// Close the first and last segments' file handles, collecting all errors.
+	var closeErr error
+	if err := q.firstSegment.close(); err != nil {
+		closeErr = errors.Join(closeErr, err)
 	}
 	if q.firstSegment != q.lastSegment {
-		if err = q.lastSegment.close(); err != nil {
-			return err
+		if err := q.lastSegment.close(); err != nil {
+			closeErr = errors.Join(closeErr, err)
 		}
 	}
+
+	// Release the lock and close the lock file descriptor.
+	if err := q.fileLock.Close(); err != nil {
+		closeErr = errors.Join(closeErr, err)
+	}
+
+	// Mark the instance as closed first, so any unsynchronized readers
+	// see the closed state before the segments are nil-ed.
+	q.closed = true
 
 	// Safe-guard ourself from accidentally using segments after closing the queue
 	q.firstSegment = nil
 	q.lastSegment = nil
+	q.fileLock = nil
+	q.emptyCond.Broadcast()
 
-	return nil
+	return closeErr
 }
 
 // Enqueue adds an item to the end of the queue
@@ -213,7 +210,7 @@ func (q *DQue) Enqueue(obj interface{}) error {
 	q.mutex.Lock()
 	defer q.mutex.Unlock()
 
-	if q.fileLock == nil {
+	if q.closed {
 		return ErrQueueClosed
 	}
 
@@ -253,6 +250,10 @@ func (q *DQue) Enqueue(obj interface{}) error {
 
 // Dequeue removes and returns the first item in the queue.
 // When the queue is empty, nil and dque.ErrEmpty are returned.
+//
+// On error, the returned object may still be non-nil and valid — it was
+// successfully dequeued but subsequent cleanup (segment deletion or creation)
+// failed. Callers should process the returned object even when err != nil.
 func (q *DQue) Dequeue() (interface{}, error) {
 	// This is heavy-handed but its safe
 	q.mutex.Lock()
@@ -262,7 +263,7 @@ func (q *DQue) Dequeue() (interface{}, error) {
 }
 
 func (q *DQue) dequeueLocked() (interface{}, error) {
-	if q.fileLock == nil {
+	if q.closed {
 		return nil, ErrQueueClosed
 	}
 
@@ -330,7 +331,7 @@ func (q *DQue) Peek() (interface{}, error) {
 }
 
 func (q *DQue) peekLocked() (interface{}, error) {
-	if q.fileLock == nil {
+	if q.closed {
 		return nil, ErrQueueClosed
 	}
 
@@ -355,7 +356,7 @@ func (q *DQue) DequeueBlock() (interface{}, error) {
 		obj, err := q.dequeueLocked()
 		if err == ErrEmpty {
 			q.emptyCond.Wait()
-			// Wait() atomically unlocks mutexEmptyCond and suspends execution of the calling goroutine.
+			// Wait() atomically unlocks q.mutex and suspends execution of the calling goroutine.
 			// Receiving the signal does not guarantee an item is available, let's loop and check again.
 			continue
 		} else if err != nil {
@@ -373,7 +374,7 @@ func (q *DQue) PeekBlock() (interface{}, error) {
 		obj, err := q.peekLocked()
 		if err == ErrEmpty {
 			q.emptyCond.Wait()
-			// Wait() atomically unlocks mutexEmptyCond and suspends execution of the calling goroutine.
+			// Wait() atomically unlocks q.mutex and suspends execution of the calling goroutine.
 			// Receiving the signal does not guarantee an item is available, let's loop and check again.
 			continue
 		} else if err != nil {
@@ -387,28 +388,19 @@ func (q *DQue) PeekBlock() (interface{}, error) {
 // size... unless you have changed the itemsPerSegment value since the queue
 // was last empty.  Then it could be wildly inaccurate.
 func (q *DQue) Size() int {
-	if q.fileLock == nil {
-		return 0
-	}
-
 	// This is heavy-handed but it is safe
 	q.mutex.Lock()
 	defer q.mutex.Unlock()
 
-	return q.SizeUnsafe()
-}
-
-// SizeUnsafe returns the approximate number of items in the queue.  Use Size() if
-// having the exact size is important to your use-case.
-//
-// The return value could be wildly inaccurate if the itemsPerSegment value has
-// changed since the queue was last empty.
-// Also, because this method is not synchronized, the size may change after
-// entering this method.
-func (q *DQue) SizeUnsafe() int {
-	if q.fileLock == nil {
+	if q.closed {
 		return 0
 	}
+
+	return q.sizeUnsafeLocked()
+}
+
+// sizeUnsafeLocked calculates the approximate size while holding q.mutex.
+func (q *DQue) sizeUnsafeLocked() int {
 	if q.firstSegment.number == q.lastSegment.number {
 		return q.firstSegment.size()
 	}
@@ -416,10 +408,29 @@ func (q *DQue) SizeUnsafe() int {
 	return q.firstSegment.size() + (numSegmentsBetween * q.config.ItemsPerSegment) + q.lastSegment.size()
 }
 
+// SizeUnsafe returns the approximate number of items in the queue.  Use Size() if
+// having the exact size is important to your use-case.
+//
+// The return value could be wildly inaccurate if the itemsPerSegment value has
+// changed since the queue was last empty.
+// Also, because the value is taken under lock, the size may change after
+// returning from this method.
+func (q *DQue) SizeUnsafe() int {
+	q.mutex.Lock()
+	defer q.mutex.Unlock()
+	if q.closed {
+		return 0
+	}
+	return q.sizeUnsafeLocked()
+}
+
 // SegmentNumbers returns the number of both the first last segmment.
 // There is likely no use for this information other than testing.
 func (q *DQue) SegmentNumbers() (int, int) {
-	if q.fileLock == nil {
+	q.mutex.Lock()
+	defer q.mutex.Unlock()
+
+	if q.closed {
 		return 0, 0
 	}
 	return q.firstSegment.number, q.lastSegment.number
@@ -428,6 +439,12 @@ func (q *DQue) SegmentNumbers() (int, int) {
 // Turbo returns true if the turbo flag is on.  Having turbo on speeds things
 // up significantly.
 func (q *DQue) Turbo() bool {
+	q.mutex.Lock()
+	defer q.mutex.Unlock()
+
+	if q.closed {
+		return false
+	}
 	return q.turbo
 }
 
@@ -440,7 +457,7 @@ func (q *DQue) TurboOn() error {
 	q.mutex.Lock()
 	defer q.mutex.Unlock()
 
-	if q.fileLock == nil {
+	if q.closed {
 		return ErrQueueClosed
 	}
 
@@ -461,7 +478,7 @@ func (q *DQue) TurboOff() error {
 	q.mutex.Lock()
 	defer q.mutex.Unlock()
 
-	if q.fileLock == nil {
+	if q.closed {
 		return ErrQueueClosed
 	}
 
@@ -485,7 +502,7 @@ func (q *DQue) TurboSync() error {
 	q.mutex.Lock()
 	defer q.mutex.Unlock()
 
-	if q.fileLock == nil {
+	if q.closed {
 		return ErrQueueClosed
 	}
 	if !q.turbo {
@@ -504,7 +521,7 @@ func (q *DQue) TurboSync() error {
 func (q *DQue) load() error {
 
 	// Find all queue files
-	files, err := ioutil.ReadDir(q.fullPath)
+	files, err := os.ReadDir(q.fullPath)
 	if err != nil {
 		return errors.Wrap(err, "unable to read files in "+q.fullPath)
 	}
@@ -529,8 +546,8 @@ func (q *DQue) load() error {
 	// If files were found, set q.firstSegment and q.lastSegment
 	if maxNum > 0 {
 
-		// We found files
-		for {
+		// We found files. Skip any segments that are empty and complete.
+		for minNum <= maxNum {
 			seg, err := openQueueSegment(q.fullPath, minNum, q.turbo, q.builder)
 			if err != nil {
 				return errors.Wrap(err, "unable to create queue segment in "+q.fullPath)
@@ -541,26 +558,17 @@ func (q *DQue) load() error {
 				break
 			}
 			// Delete the segment as it's empty and complete
-			seg.delete()
+			if err := seg.delete(); err != nil {
+				return errors.Wrap(err, "unable to delete empty segment in "+q.fullPath)
+			}
 			// Try the next one
 			minNum++
 		}
+	}
 
-		if minNum == maxNum {
-			// We have only one segment so the
-			// first and last are the same instance (in this case)
-			q.lastSegment = q.firstSegment
-		} else {
-			// We have multiple segments
-			seg, err := openQueueSegment(q.fullPath, maxNum, q.turbo, q.builder)
-			if err != nil {
-				return errors.Wrap(err, "unable to create segment for "+q.fullPath)
-			}
-			q.lastSegment = seg
-		}
-
-	} else {
-		// We found no files so build a new queue starting with segment 1
+	switch {
+	case q.firstSegment == nil:
+		// We found no usable segments so build a new queue starting with segment 1
 		seg, err := newQueueSegment(q.fullPath, 1, q.turbo, q.builder)
 		if err != nil {
 			return errors.Wrap(err, "unable to create queue segment in "+q.fullPath)
@@ -569,14 +577,32 @@ func (q *DQue) load() error {
 		// The first and last are the same instance (in this case)
 		q.firstSegment = seg
 		q.lastSegment = seg
+	case minNum == maxNum:
+		// We have only one segment so the
+		// first and last are the same instance (in this case)
+		q.lastSegment = q.firstSegment
+	default:
+		// We have multiple segments
+		seg, err := openQueueSegment(q.fullPath, maxNum, q.turbo, q.builder)
+		if err != nil {
+			return errors.Wrap(err, "unable to create segment for "+q.fullPath)
+		}
+		q.lastSegment = seg
 	}
 
 	return nil
 }
 
 func (q *DQue) lock() error {
-	l := path.Join(q.DirPath, q.Name, lockFile)
+	l := filepath.Join(q.DirPath, q.Name, lockFile)
 	fileLock := flock.New(l)
+
+	acquired := false
+	defer func() {
+		if !acquired {
+			_ = fileLock.Close()
+		}
+	}()
 
 	locked, err := fileLock.TryLock()
 	if err != nil {
@@ -586,6 +612,31 @@ func (q *DQue) lock() error {
 		return errors.New("failed to acquire flock")
 	}
 
+	acquired = true
 	q.fileLock = fileLock
+	return nil
+}
+
+func (q *DQue) initQueue(fullPath string, itemsPerSegment int, builder func() interface{}) error {
+	q.fullPath = fullPath
+	q.config.ItemsPerSegment = itemsPerSegment
+	q.builder = builder
+	q.emptyCond = sync.NewCond(&q.mutex)
+	if err := q.lock(); err != nil {
+		return err
+	}
+	if err := q.load(); err != nil {
+		// Close any segments that were opened before the failure.
+		if q.firstSegment != nil {
+			_ = q.firstSegment.close()
+		}
+		if q.lastSegment != nil && q.lastSegment != q.firstSegment {
+			_ = q.lastSegment.close()
+		}
+		if releaseErr := q.fileLock.Close(); releaseErr != nil {
+			return errors.Join(err, releaseErr)
+		}
+		return err
+	}
 	return nil
 }

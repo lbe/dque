@@ -6,11 +6,13 @@ package dque
 //
 
 import (
-	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
+
+	"github.com/joncrlsn/dque/internal/errors"
 )
 
 // item1 is the thing we'll be storing in the queue
@@ -26,39 +28,54 @@ func item1Builder() interface{} {
 
 // Test_segment verifies the behavior of one segment.
 func TestSegment(t *testing.T) {
-	testDir := "./TestSegment"
-	os.RemoveAll(testDir)
-	if err := os.Mkdir(testDir, 0755); err != nil {
-		t.Fatalf("Error creating directory from the TestSegment method: %s\n", err)
-	}
+	testDir := t.TempDir()
 
 	// Create a new segment of the queue
 	seg, err := newQueueSegment(testDir, 1, false, item1Builder)
 	if err != nil {
 		t.Fatalf("newQueueSegment('%s') failed with '%s'\n", testDir, err.Error())
 	}
+	defer func() { _ = seg.close() }()
 
 	//
 	// Add some items and remove one
 	//
-	assert(t, seg.add(&item1{Name: "Number 1"}) == nil, "failed to add item1")
-	assert(t, 1 == seg.size(), "Expected size of 1")
+	if seg.add(&item1{Name: "Number 1"}) != nil {
+		t.Fatalf("failed to add item1")
+	}
+	if seg.size() != 1 {
+		t.Fatalf("Expected size of 1")
+	}
 
-	assert(t, seg.add(&item1{Name: "Number 2"}) == nil, "failed to add item2")
-	assert(t, 2 == seg.size(), "Expected size of 2")
+	if seg.add(&item1{Name: "Number 2"}) != nil {
+		t.Fatalf("failed to add item2")
+	}
+	if seg.size() != 2 {
+		t.Fatalf("Expected size of 2")
+	}
 	_, err = seg.remove()
 	if err != nil {
 		t.Fatalf("Remove() failed with '%s'\n", err.Error())
 	}
-	assert(t, 1 == seg.size(), "Expected size of 1")
-	assert(t, 2 == seg.sizeOnDisk(), "Expected sizeOnDisk of 2")
-	assert(t, seg.add(&item1{Name: "item3"}) == nil, "failed to add item3")
-	assert(t, 2 == seg.size(), "Expected size of 2")
+	if seg.size() != 1 {
+		t.Fatalf("Expected size of 1")
+	}
+	if seg.sizeOnDisk() != 2 {
+		t.Fatalf("Expected sizeOnDisk of 2")
+	}
+	if seg.add(&item1{Name: "item3"}) != nil {
+		t.Fatalf("failed to add item3")
+	}
+	if seg.size() != 2 {
+		t.Fatalf("Expected size of 2")
+	}
 	_, err = seg.remove()
 	if err != nil {
 		t.Fatalf("Remove() failed with '%s'\n", err.Error())
 	}
-	assert(t, 1 == seg.size(), "Expected size of 1")
+	if seg.size() != 1 {
+		t.Fatalf("Expected size of 1")
+	}
 
 	//
 	// Recreate the segment from disk and remove the remaining item
@@ -67,7 +84,10 @@ func TestSegment(t *testing.T) {
 	if err != nil {
 		t.Fatalf("openQueueSegment('%s') failed with '%s'\n", testDir, err.Error())
 	}
-	assert(t, 1 == seg.size(), "Expected size of 1")
+	defer func() { _ = seg.close() }()
+	if seg.size() != 1 {
+		t.Fatalf("Expected size of 1")
+	}
 
 	_, err = seg.remove()
 	if err != nil {
@@ -75,103 +95,339 @@ func TestSegment(t *testing.T) {
 			t.Fatalf("Remove() failed with '%s'\n", err.Error())
 		}
 	}
-	assert(t, 0 == seg.size(), "Expected size of 0")
-
-	// Cleanup
-	if err := os.RemoveAll(testDir); err != nil {
-		t.Fatalf("Error cleaning up directory from the TestSegment method with '%s'\n", err.Error())
+	if seg.size() != 0 {
+		t.Fatalf("Expected size of 0")
 	}
 }
 
 // TestSegment_ErrCorruptedSegment tests error handling for corrupted data
 func TestSegment_ErrCorruptedSegment(t *testing.T) {
-	testDir := "./TestSegmentError"
-	os.RemoveAll(testDir)
-	defer os.RemoveAll((testDir))
+	testDir := t.TempDir()
+	expectedPath := (&qSegment{dirPath: testDir}).filePath()
 
-	if err := os.Mkdir(testDir, 0755); err != nil {
-		t.Fatalf("Error creating directory in the TestSegment_ErrCorruptedSegment method: %s\n", err)
-	}
-
-	f, err := os.Create((&qSegment{dirPath: testDir}).filePath())
+	f, err := os.Create(expectedPath)
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	// expect an 8 byte object, but only write 7 bytes
-	if _, err := f.Write([]byte{0, 0, 0, 8, 1, 2, 3, 4, 5, 6, 7}); err != nil {
+	// Write a length of 8 in little-endian, but only 7 bytes of data follow.
+	if _, err = f.Write([]byte{8, 0, 0, 0, 1, 2, 3, 4, 5, 6, 7}); err != nil {
 		t.Fatal(err)
 	}
-	f.Close()
+	if err = f.Close(); err != nil {
+		t.Errorf("Close failed: %v", err)
+	}
 
 	_, err = openQueueSegment(testDir, 0, false, func() interface{} { return make([]byte, 8) })
 	if err == nil {
 		t.Fatal("expected ErrCorruptedSegment but got nil")
 	}
-	// // go >= 1.13:
-	// var corruptedError ErrCorruptedSegment
-	// if !errors.As(err, &corruptedError) {
-	// 	t.Fatalf("expected ErrCorruptedSegment but got %T: %s", err, err)
-	// }
-	corruptedError, ok := unwrapError(unwrapError(err)).(ErrCorruptedSegment)
-	if !ok {
+	var corruptedError ErrCorruptedSegment
+	if !errors.As(err, &corruptedError) {
 		t.Fatalf("expected ErrCorruptedSegment but got %T: %s", err, err)
 	}
-	if corruptedError.Path != "TestSegmentError/0000000000000.dque" {
+	if corruptedError.Path != expectedPath {
 		t.Fatalf("unexpected file path: %s", corruptedError.Path)
 	}
-	if corruptedError.Error() != "segment file TestSegmentError/0000000000000.dque is corrupted: error reading gob data from file: unexpected EOF" {
-		t.Fatalf("wrong error message: %s", corruptedError.Error())
+	expected := "segment file " + expectedPath + " is corrupted: error reading gob data from file: unexpected EOF"
+	if !strings.HasPrefix(corruptedError.Error(), expected) {
+		t.Fatalf("wrong error message prefix: %s", corruptedError.Error())
 	}
 }
 
-func unwrapError(err error) error {
-	return err.(interface{ Unwrap() error }).Unwrap()
+// TestSegment_ErrCorruptedSegment_gobLenCap verifies the gobLen sanity cap in load().
+func TestSegment_ErrCorruptedSegment_gobLenCap(t *testing.T) {
+	testDir := t.TempDir()
+	expectedPath := (&qSegment{dirPath: testDir}).filePath()
+
+	f, err := os.Create(expectedPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Write a 4-byte length of 0xFFFFFFFF (max uint32) to trigger the cap.
+	if _, err = f.Write([]byte{0xFF, 0xFF, 0xFF, 0xFF}); err != nil {
+		t.Fatal(err)
+	}
+	if err = f.Close(); err != nil {
+		t.Errorf("Close failed: %v", err)
+	}
+
+	_, err = openQueueSegment(testDir, 0, false, func() interface{} { return make([]byte, 4) })
+	if err == nil {
+		t.Fatal("expected ErrCorruptedSegment but got nil")
+	}
+	var corruptedError ErrCorruptedSegment
+	if !errors.As(err, &corruptedError) {
+		t.Fatalf("expected ErrCorruptedSegment but got %T: %s", err, err)
+	}
+	if corruptedError.Path != expectedPath {
+		t.Fatalf("unexpected file path: %s", corruptedError.Path)
+	}
+	if !strings.Contains(corruptedError.Error(), "exceeds maximum") {
+		t.Fatalf("expected 'exceeds maximum' in error, got: %s", corruptedError.Error())
+	}
+}
+
+// TestSegment_ErrorTypes verifies the Error and Unwrap methods of the exported error types.
+func TestSegment_ErrorTypes(t *testing.T) {
+	root := errors.New("root cause")
+
+	corrupted := ErrCorruptedSegment{Path: "/tmp/segment.dque", Err: root}
+	if !strings.HasPrefix(corrupted.Error(), "segment file /tmp/segment.dque is corrupted: root cause") {
+		t.Fatalf("unexpected corrupted error message: %s", corrupted.Error())
+	}
+	if corrupted.Unwrap() != root {
+		t.Fatal("ErrCorruptedSegment.Unwrap() should return the wrapped error")
+	}
+
+	decode := ErrUnableToDecode{Path: "/tmp/segment.dque", Err: root}
+	if !strings.HasPrefix(decode.Error(), "object in segment file /tmp/segment.dque cannot be decoded: root cause") {
+		t.Fatalf("unexpected decode error message: %s", decode.Error())
+	}
+	if decode.Unwrap() != root {
+		t.Fatal("ErrUnableToDecode.Unwrap() should return the wrapped error")
+	}
+}
+
+// TestSegment_newQueueSegmentErrors verifies error paths in newQueueSegment.
+func TestSegment_newQueueSegmentErrors(t *testing.T) {
+	testDir := t.TempDir()
+
+	// Invalid directory.
+	seg, err := newQueueSegment(filepath.Join(testDir, "does-not-exist"), 1, false, item1Builder)
+	if err == nil {
+		t.Fatal("expected newQueueSegment to fail with invalid directory")
+	}
+	if seg != nil {
+		t.Fatal("expected nil segment on error")
+	}
+
+	workingDir := filepath.Join(testDir, "working")
+	if err = os.Mkdir(workingDir, 0755); err != nil {
+		t.Fatalf("failed to create test directory: %s", err)
+	}
+
+	// Create a file with the segment name so newQueueSegment fails because it already exists.
+	segPath := (&qSegment{dirPath: workingDir, number: 1}).filePath()
+	f, err := os.Create(segPath)
+	if err != nil {
+		t.Fatalf("failed to create segment file: %s", err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatalf("failed to close segment file: %s", err)
+	}
+
+	seg, err = newQueueSegment(workingDir, 1, false, item1Builder)
+	if err == nil {
+		t.Fatal("expected newQueueSegment to fail when file already exists")
+	}
+	if seg != nil {
+		t.Fatal("expected nil segment on error")
+	}
+
+	// Make the directory read-only so creating a new segment file fails.
+	// Permissions are ignored on Windows and when running as root, so skip
+	// this sub-case there.
+	if runtime.GOOS == "windows" || os.Getuid() == 0 {
+		return
+	}
+	readOnlyDir := filepath.Join(testDir, "readonly")
+	if err = os.Mkdir(readOnlyDir, 0500); err != nil {
+		t.Fatalf("failed to create read-only directory: %s", err)
+	}
+
+	seg, err = newQueueSegment(readOnlyDir, 1, false, item1Builder)
+	if err == nil {
+		t.Fatal("expected newQueueSegment to fail when file cannot be created")
+	}
+	if seg != nil {
+		t.Fatal("expected nil segment on error")
+	}
+}
+
+// TestSegment_openQueueSegmentErrors verifies error paths in openQueueSegment.
+func TestSegment_openQueueSegmentErrors(t *testing.T) {
+	testDir := t.TempDir()
+
+	// Invalid directory.
+	seg, err := openQueueSegment(filepath.Join(testDir, "does-not-exist"), 1, false, item1Builder)
+	if err == nil {
+		t.Fatal("expected openQueueSegment to fail with invalid directory")
+	}
+	if seg != nil {
+		t.Fatal("expected nil segment on error")
+	}
+
+	workingDir := filepath.Join(testDir, "working")
+	if err = os.Mkdir(workingDir, 0755); err != nil {
+		t.Fatalf("failed to create test directory: %s", err)
+	}
+
+	// File does not exist.
+	seg, err = openQueueSegment(workingDir, 1, false, item1Builder)
+	if err == nil {
+		t.Fatal("expected openQueueSegment to fail when file does not exist")
+	}
+	if seg != nil {
+		t.Fatal("expected nil segment on error")
+	}
+}
+
+// TestSegment_loadFileOpenError verifies load() fails when the segment file cannot be opened.
+func TestSegment_loadFileOpenError(t *testing.T) {
+	testDir := t.TempDir()
+
+	seg := &qSegment{dirPath: testDir, number: 1, objectBuilder: item1Builder}
+	if err := seg.load(); err == nil {
+		t.Fatal("expected load() to fail when the file does not exist")
+	}
+}
+
+// TestSegment_addGobEncodeError verifies add() fails when the object cannot be gob encoded.
+func TestSegment_addGobEncodeError(t *testing.T) {
+	testDir := t.TempDir()
+
+	seg, err := newQueueSegment(testDir, 1, false, item1Builder)
+	if err != nil {
+		t.Fatalf("newQueueSegment failed: %s", err)
+	}
+	defer func() { _ = seg.close() }()
+
+	// Channels cannot be gob encoded.
+	if err := seg.add(make(chan int)); err == nil {
+		t.Fatal("expected add() to fail for unencodable object")
+	}
+}
+
+// TestSegment_ErrUnableToDecode tests decoding failure for invalid gob data.
+func TestSegment_ErrUnableToDecode(t *testing.T) {
+	testDir := t.TempDir()
+
+	f, err := os.Create((&qSegment{dirPath: testDir}).filePath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Write a length prefix for a 4-byte object but invalid gob bytes.
+	if _, err = f.Write([]byte{4, 0, 0, 0, 1, 2, 3, 4}); err != nil {
+		t.Fatal(err)
+	}
+	if err = f.Close(); err != nil {
+		t.Errorf("Close failed: %v", err)
+	}
+
+	_, err = openQueueSegment(testDir, 0, false, func() interface{} { return make([]byte, 4) })
+	if err == nil {
+		t.Fatal("expected error for undecodable object")
+	}
+	var decodeErr ErrUnableToDecode
+	if !errors.As(err, &decodeErr) {
+		t.Fatalf("expected ErrUnableToDecode but got %T: %s", err, err)
+	}
+}
+
+// TestSegment_ExcessDeletionRecords tests corruption detection for deletion records without items.
+func TestSegment_ExcessDeletionRecords(t *testing.T) {
+	testDir := t.TempDir()
+
+	f, err := os.Create((&qSegment{dirPath: testDir}).filePath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A zero-length record signifies a deletion, but no items were enqueued.
+	if _, err = f.Write([]byte{0, 0, 0, 0}); err != nil {
+		t.Fatal(err)
+	}
+	if err = f.Close(); err != nil {
+		t.Errorf("Close failed: %v", err)
+	}
+
+	_, err = openQueueSegment(testDir, 0, false, func() interface{} { return make([]byte, 4) })
+	if err == nil {
+		t.Fatal("expected error for excess deletion records")
+	}
+	var corrupted ErrCorruptedSegment
+	if !errors.As(err, &corrupted) {
+		t.Fatalf("expected ErrCorruptedSegment but got %T: %s", err, err)
+	}
+}
+
+// TestSegment_turboOffWhenOff verifies turboOff is safe when turbo is already off.
+func TestSegment_turboOffWhenOff(t *testing.T) {
+	testDir := t.TempDir()
+
+	seg, err := newQueueSegment(testDir, 1, false, item1Builder)
+	if err != nil {
+		t.Fatalf("newQueueSegment failed: %s", err)
+	}
+	defer func() { _ = seg.close() }()
+
+	if err := seg.turboOff(); err != nil {
+		t.Fatalf("turboOff on non-turbo segment should be safe: %s", err)
+	}
+}
+
+// TestSegment_turboSyncWhenOff verifies turboSync is safe when turbo is off.
+func TestSegment_turboSyncWhenOff(t *testing.T) {
+	testDir := t.TempDir()
+
+	seg, err := newQueueSegment(testDir, 1, false, item1Builder)
+	if err != nil {
+		t.Fatalf("newQueueSegment failed: %s", err)
+	}
+	defer func() { _ = seg.close() }()
+
+	if err := seg.turboSync(); err != nil {
+		t.Fatalf("turboSync on non-turbo segment should be safe: %s", err)
+	}
 }
 
 // TestSegment_Open verifies the behavior of the openSegment function.
 func TestSegment_openQueueSegment_failIfNew(t *testing.T) {
-	testDir := "./TestSegment_Open"
-	os.RemoveAll(testDir)
-	if err := os.Mkdir(testDir, 0755); err != nil {
-		t.Fatalf("Error creating directory in the TestSegment_Open method: %s\n", err)
-	}
+	testDir := t.TempDir()
 
 	seg, err := openQueueSegment(testDir, 1, false, item1Builder)
 	if err == nil {
 		t.Fatalf("openQueueSegment('%s') should have failed because it should be new\n", testDir)
 	}
-	assert(t, seg == nil, "segment after failure must be nil")
-
-	// Cleanup
-	if err := os.RemoveAll(testDir); err != nil {
-		t.Fatalf("Error cleaning up directory from the TestSegment_Open method with '%s'\n", err.Error())
+	if seg != nil {
+		t.Fatalf("segment after failure must be nil")
 	}
 }
 
 // TestSegment_Turbo verifies the behavior of the turboOn() and turboOff() methods.
 func TestSegment_Turbo(t *testing.T) {
-	testDir := "./TestSegment"
-	os.RemoveAll(testDir)
-	if err := os.Mkdir(testDir, 0755); err != nil {
-		t.Fatalf("Error creating directory in the TestSegment_Turbo method: %s\n", err)
-	}
+	testDir := t.TempDir()
 
 	seg, err := newQueueSegment(testDir, 10, false, item1Builder)
 	if err != nil {
 		t.Fatalf("newQueueSegment('%s') failed\n", testDir)
 	}
+	defer func() { _ = seg.close() }()
 
 	// turbo is off so expect syncCount to change
-	assert(t, seg.add(&item1{Name: "Number 1"}) == nil, "failed to add item1")
-	assert(t, 1 == seg.size(), "Expected size of 1")
-	assert(t, 1 == seg.syncCount, "syncCount must be 1")
+	if seg.add(&item1{Name: "Number 1"}) != nil {
+		t.Fatalf("failed to add item1")
+	}
+	if seg.size() != 1 {
+		t.Fatalf("Expected size of 1")
+	}
+	if seg.syncCount != 1 {
+		t.Fatalf("syncCount must be 1")
+	}
 
 	// Turn on turbo and expect sync count to stay the same.
 	seg.turboOn()
-	assert(t, seg.add(&item1{Name: "Number 2"}) == nil, "failed to add item2")
-	assert(t, 2 == seg.size(), "Expected size of 2")
-	assert(t, 1 == seg.syncCount, "syncCount must still be 1")
+	if seg.add(&item1{Name: "Number 2"}) != nil {
+		t.Fatalf("failed to add item2")
+	}
+	if seg.size() != 2 {
+		t.Fatalf("Expected size of 2")
+	}
+	if seg.syncCount != 1 {
+		t.Fatalf("syncCount must still be 1")
+	}
 
 	// Turn off turbo and expect the syncCount to increase when remove is called.
 	if err = seg.turboOff(); err != nil {
@@ -179,26 +435,41 @@ func TestSegment_Turbo(t *testing.T) {
 	}
 
 	// seg.turboOff() calls seg.turboSync() which increments syncCount
-	assert(t, 2 == seg.syncCount, "syncCount must be 2 now")
+	if seg.syncCount != 2 {
+		t.Fatalf("syncCount must be 2 now")
+	}
 
 	_, err = seg.remove()
 	if err != nil {
 		t.Fatalf("Remove() failed with '%s'\n", err.Error())
 	}
 	// seg.remove() calls seg._sync() which increments syncCount
-	assert(t, 3 == seg.syncCount, "syncCount must be 3 now")
-
-	// Cleanup
-	if err := os.RemoveAll(testDir); err != nil {
-		t.Fatalf("Error cleaning up directory from the TestSegment_Open method with '%s'\n", err.Error())
+	if seg.syncCount != 3 {
+		t.Fatalf("syncCount must be 3 now")
 	}
 }
 
-// assert fails the test if the condition is false.
-func assert(tb testing.TB, condition bool, msg string, v ...interface{}) {
-	if !condition {
-		_, file, line, _ := runtime.Caller(1)
-		fmt.Printf("\033[31m%s:%d: "+msg+"\033[39m\n\n", append([]interface{}{filepath.Base(file), line}, v...)...)
-		tb.FailNow()
+// TestSegment_closeNilsFile verifies that close() sets seg.file to nil.
+func TestSegment_closeNilsFile(t *testing.T) {
+	testDir := t.TempDir()
+
+	seg, err := newQueueSegment(testDir, 1, false, item1Builder)
+	if err != nil {
+		t.Fatalf("newQueueSegment failed: %s", err)
+	}
+
+	if seg.file == nil {
+		t.Fatalf("expected seg.file to be non-nil before close")
+	}
+	if err := seg.close(); err != nil {
+		t.Fatalf("close failed: %s", err)
+	}
+	if seg.file != nil {
+		t.Fatalf("expected seg.file to be nil after close")
+	}
+
+	// close() is idempotent when seg.file is nil.
+	if err := seg.close(); err != nil {
+		t.Fatalf("second close on nil file failed: %s", err)
 	}
 }

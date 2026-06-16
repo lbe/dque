@@ -3,11 +3,9 @@
 // Benchmarks to see how long each operation takes on average.
 //
 // Example:   go test -bench=.
-//
 package dque_test
 
 import (
-	"os"
 	"testing"
 
 	"github.com/joncrlsn/dque"
@@ -22,7 +20,7 @@ type item3 struct {
 
 // item3Builder creates a new item and returns a pointer to it.
 // This is used when we load a segment of the queue from disk.
-func item3Builder() interface{} {
+func item3Builder() any {
 	return &item3{}
 }
 
@@ -36,16 +34,12 @@ func BenchmarkEnqueue_Turbo(b *testing.B) {
 func benchmarkEnqueue(b *testing.B, turbo bool) {
 
 	qName := "testBenchEnqueue"
+	dir := b.TempDir()
 
 	b.StopTimer()
 
-	// Clean up from a previous run
-	if err := os.RemoveAll(qName); err != nil {
-		b.Fatal("Error removing queue directory:", err)
-	}
-
 	// Create the queue
-	q, err := dque.New(qName, ".", 100, item3Builder)
+	q, err := dque.New(qName, dir, 100, item3Builder)
 	if err != nil {
 		b.Fatal("Error creating new dque:", err)
 	}
@@ -60,11 +54,6 @@ func benchmarkEnqueue(b *testing.B, turbo bool) {
 			b.Fatal("Error enqueuing to dque:", err)
 		}
 	}
-
-	// Clean up from the run
-	if err := os.RemoveAll(qName); err != nil {
-		b.Fatal("Error removing queue directory for BenchmarkDequeue:", err)
-	}
 }
 
 func BenchmarkDequeue_Safe(b *testing.B) {
@@ -77,23 +66,19 @@ func BenchmarkDequeue_Turbo(b *testing.B) {
 func benchmarkDequeue(b *testing.B, turbo bool) {
 
 	qName := "testBenchDequeue"
+	dir := b.TempDir()
 
 	b.StopTimer()
 
-	// Clean up from a previous run
-	if err := os.RemoveAll(qName); err != nil {
-		b.Fatal("Error removing queue directory:", err)
-	}
-
 	// Create the queue
-	q, err := dque.New(qName, ".", 100, item3Builder)
+	q, err := dque.New(qName, dir, 100, item3Builder)
 	if err != nil {
 		b.Fatal("Error creating new dque", err)
 	}
-	var iterations int = 5000
+	iterations := 5000
 	if turbo {
 		_ = q.TurboOn()
-		iterations = iterations * 10
+		iterations *= 10
 	}
 
 	for i := 0; i < iterations; i++ {
@@ -109,10 +94,5 @@ func benchmarkDequeue(b *testing.B, turbo bool) {
 		if err != nil {
 			b.Fatal("Error dequeuing from dque:", err)
 		}
-	}
-
-	// Clean up from the run
-	if err := os.RemoveAll(qName); err != nil {
-		b.Fatal("Error removing queue directory for BenchmarkDequeue", err)
 	}
 }

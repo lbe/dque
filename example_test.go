@@ -8,6 +8,7 @@ package dque_test
 import (
 	"fmt"
 	"log"
+	"os"
 
 	"github.com/joncrlsn/dque"
 )
@@ -21,14 +22,14 @@ type Item struct {
 
 // ItemBuilder creates a new item and returns a pointer to it.
 // This is used when we load a segment of the queue from disk.
-func ItemBuilder() interface{} {
+func ItemBuilder() any {
 	return &Item{}
 }
 
 // ExampleDQue shows how the queue works
 func ExampleDQue() {
 	qName := "item-queue"
-	qDir := "/tmp"
+	qDir := os.TempDir()
 	segmentSize := 50
 
 	// Create a new queue with segment size of 50
@@ -38,13 +39,15 @@ func ExampleDQue() {
 	}
 
 	// Add an item to the queue
-	if err := q.Enqueue(&Item{"Joe", 1}); err != nil {
+	if err = q.Enqueue(&Item{"Joe", 1}); err != nil {
 		log.Fatal("Error enqueueing item ", err)
 	}
 	log.Println("Size should be 1:", q.Size())
 
 	// Properly close a queue
-	q.Close()
+	if err = q.Close(); err != nil {
+		log.Fatal("Error closing dque ", err)
+	}
 
 	// You can reconsitute the queue from disk at any time
 	q, err = dque.Open(qName, qDir, segmentSize, ItemBuilder)
@@ -53,7 +56,7 @@ func ExampleDQue() {
 	}
 
 	// Peek at the next item in the queue
-	var iface interface{}
+	var iface any
 	if iface, err = q.Peek(); err != nil {
 		if err != dque.ErrEmpty {
 			log.Fatal("Error peeking at item", err)
@@ -69,8 +72,7 @@ func ExampleDQue() {
 	log.Println("Size should be zero:", q.Size())
 
 	go func() {
-		err := q.Enqueue(&Item{"Joe", 1})
-		log.Println("Enqueued from goroutine", err == nil)
+		_ = q.Enqueue(&Item{"Joe", 1})
 	}()
 
 	// Dequeue the next item in the queue and block until one is available
